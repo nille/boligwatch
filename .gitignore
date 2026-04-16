@@ -1,0 +1,16 @@
+# Runtime state
+.boligwatch_seen.json
+boligwatch.log
+
+# Personal config (use boligwatch_config.example.json as template)
+boligwatch_config.json
+
+# Personal data
+message.md
+contacted_listings/
+dry-run-screenshot.png
+
+# OS / editor
+.DS_Store
+.claude/
+.playwright-mcp/
