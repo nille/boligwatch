@@ -106,6 +106,40 @@ in 2 hours, check boligwatch for new listings and ping me if anything appeared
 
 Scheduled tasks are session-scoped and expire after 7 days. For durable scheduling that survives restarts, see [Claude Code routines](https://code.claude.com/docs/en/routines) or [desktop scheduled tasks](https://code.claude.com/docs/en/desktop-scheduled-tasks).
 
+### Browser automation with Playwright MCP
+
+The real power comes from combining BoligWatch with [Playwright MCP](https://github.com/microsoft/playwright-mcp) and the [Playwright MCP Bridge](https://chromewebstore.google.com/detail/playwright-mcp-bridge/mmlmfjhmonkocbjadbfplnigmagldckm) Chrome extension. Together, they let Claude control your actual browser — with your logged-in boligportal.dk session, cookies, and all.
+
+This means Claude can do more than just find listings. It can navigate to them, read the full details, contact the landlord, fill in forms, and send messages — all without you in the loop.
+
+**Setup:**
+
+1. Install the [Playwright MCP Bridge](https://chromewebstore.google.com/detail/playwright-mcp-bridge/mmlmfjhmonkocbjadbfplnigmagldckm) extension in Chrome
+2. Add the Playwright MCP server to your Claude Code config with the `--extension` flag:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--extension"]
+    }
+  }
+}
+```
+
+**Example — fully autonomous apartment hunting:**
+
+```
+/loop 5m run python boligwatch.py --peek and review any new listings.
+For anything under 16.000kr with 3+ rooms, use Playwright to open the
+listing on boligportal.dk, read the full description, and if it looks
+good, click "Kontakt udlejer" and send a short inquiry message in Danish.
+Mark contacted listings as seen with --mark-seen.
+```
+
+Because the extension bridges into your existing browser session, Claude authenticates as you — no separate login flow, no stored credentials, no headless browser. It sees exactly what you would see.
+
 ## Requirements
 
 - Python 3.10+
