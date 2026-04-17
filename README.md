@@ -49,6 +49,8 @@ python boligwatch.py --city københavn --rooms-min 3 --max-rent 16000 --balcony
 
 BoligWatch fetches listings from boligportal.dk's search API, filters them according to your criteria, and tracks which ones you've already seen in a local JSON file. On each run it only shows new listings — ones not previously seen.
 
+The tracker also detects **re-listed apartments**: if a landlord re-publishes a listing with the same ID but a newer `advertised_date`, it resurfaces as new. This prevents missed opportunities when listings are taken down and re-posted. The seen file stores the `advertised_date` alongside the seen timestamp for comparison. Legacy entries (from older versions) are read transparently — re-listing detection is skipped for entries without a stored `advertised_date`.
+
 There are three ways to use it:
 
 1. **CLI** — run once or in watch mode, pipe JSON to other tools
@@ -87,7 +89,7 @@ There are three ways to use it:
 
 ### Search filters
 
-All filters default to no limit (unset). When using a config file, CLI flags override config values.
+All filters default to no limit (unset). See [Filter behavior](#filter-behavior) for how filters interact with the config file.
 
 #### Location
 
@@ -287,14 +289,14 @@ Add to your MCP client config (`.mcp.json`, Claude Desktop config, etc.):
 | `reset_seen` | Clear all seen-listing history |
 | `get_seen_stats` | Get tracker statistics (count, file path) |
 
-### Filter inheritance: MCP vs CLI
+### Filter behavior
 
-This is an important design distinction:
+The same logic applies to both CLI and MCP:
 
-- **CLI mode**: Filters from the config file are always applied. CLI flags override individual values. If your config says `max_rent: 17000`, every CLI search is capped at 17,000 kr unless you pass `--max-rent`.
-- **MCP mode**: Restrictive filters (rent, rooms, size, features) are **not** inherited from the config. Only structural settings (categories, location, order, max_pages) carry over. This means ad-hoc MCP queries start with a clean slate — if you ask "find apartments over 200m\u00b2" it won't silently cap at 17,000 kr because of your config.
+- **No filters passed** = uses the full saved search from your config file (your monitoring query)
+- **Any filter passed** = starts from a clean slate. Only structural settings (categories, location, order, max_pages) carry over from the config. Restrictive filters (rent, rooms, size, features) are stripped — if you ask "find apartments over 200m\u00b2" it won't silently cap at 17,000 kr because of your config.
 
-Filters you explicitly pass to MCP tools are always applied.
+This means `python boligwatch.py --peek` uses your saved search, but `python boligwatch.py --min-size 200` won't silently cap at 17,000 kr from the config. Same for MCP: `get_new_listings({})` = saved search, `search_listings({min_size_m2: 200})` = clean slate.
 
 ### MCP tool parameters
 

@@ -102,9 +102,9 @@ The API uses lowercase Danish city names with original Danish characters:
 - Odense \u2192 `odense`
 - Aalborg / \u00c5lborg \u2192 `aalborg`
 
-## Important: filter inheritance
+## Important: filter behavior
 
-MCP tools do NOT inherit restrictive filters (rent, rooms, size, features) from the server config. Only structural settings (location, categories) carry over. This means if a user asks "find the largest apartments" you don't need to worry about hidden rent caps from the config file.
+If no filters are passed, the full saved search from the config is used (the user's monitoring query). If ANY filter is passed, restrictive filters from the config are stripped — only structural settings (location, categories) carry over. This means "find the largest apartments" won't be silently capped by the config's rent limit, but "any new listings?" uses the saved search as expected.
 
 ## Workflow
 

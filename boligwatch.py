@@ -348,9 +348,17 @@ def fetch_listings(config: SearchConfig) -> list[Listing]:
 # -- Seen-Listings Tracker -------------------------------------------------
 
 class SeenTracker:
+    """Track which listings have been seen, detecting re-listings.
+
+    Each entry stores ``{"seen_at": <iso>, "advertised_date": <iso|null>}``.
+    Legacy entries (plain timestamp strings) are read transparently.
+    A listing is considered new if its ID is unseen or its advertised_date
+    is newer than the one we recorded.
+    """
+
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._seen: dict[str, str] = {}
+        self._seen: dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
@@ -362,17 +370,41 @@ class SeenTracker:
         with open(self._path, "w", encoding="utf-8") as f:
             json.dump(self._seen, f, indent=2, ensure_ascii=False)
 
-    def is_new(self, listing_id: int) -> bool:
-        return str(listing_id) not in self._seen
+    @staticmethod
+    def _get_ad_date(entry: Any) -> str | None:
+        if isinstance(entry, dict):
+            return entry.get("advertised_date")
+        return None
 
-    def mark_seen(self, listing_id: int) -> None:
-        self._seen[str(listing_id)] = datetime.now(timezone.utc).isoformat()
+    def is_new(self, listing_id: int, advertised_date: str | None = None) -> bool:
+        key = str(listing_id)
+        if key not in self._seen:
+            return True
+        if advertised_date:
+            stored_ad = self._get_ad_date(self._seen[key])
+            if stored_ad and advertised_date > stored_ad:
+                return True
+        return False
+
+    def mark_seen(self, listing_id: int, advertised_date: str | None = None) -> None:
+        self._seen[str(listing_id)] = {
+            "seen_at": datetime.now(timezone.utc).isoformat(),
+            "advertised_date": advertised_date,
+        }
         self._save()
 
-    def mark_all_seen(self, ids: list[int]) -> None:
+    def mark_all_seen(
+        self,
+        ids: list[int],
+        advertised_dates: dict[int, str | None] | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        ad_dates = advertised_dates or {}
         for lid in ids:
-            self._seen[str(lid)] = now
+            self._seen[str(lid)] = {
+                "seen_at": now,
+                "advertised_date": ad_dates.get(lid),
+            }
         self._save()
 
     def reset(self) -> int:
@@ -438,14 +470,15 @@ def run_once(
     peek: bool = False,
 ) -> list[Listing]:
     listings = fetch_listings(config)
-    new_listings = [l for l in listings if tracker.is_new(l.id)]
+    new_listings = [l for l in listings if tracker.is_new(l.id, l.advertised_date)]
 
     if json_output:
         if new_listings:
             output = [l.to_json_dict() for l in new_listings]
             print(json.dumps(output, ensure_ascii=False))
             if not peek:
-                tracker.mark_all_seen([l.id for l in new_listings])
+                ad_dates = {l.id: l.advertised_date for l in new_listings}
+                tracker.mark_all_seen([l.id for l in new_listings], advertised_dates=ad_dates)
         else:
             print("[]")
         return new_listings
@@ -458,7 +491,8 @@ def run_once(
             print()
         for listing in new_listings:
             print(f"\n{listing.format_short()}")
-        tracker.mark_all_seen([l.id for l in new_listings])
+        ad_dates = {l.id: l.advertised_date for l in new_listings}
+        tracker.mark_all_seen([l.id for l in new_listings], advertised_dates=ad_dates)
     elif not quiet:
         print("\nNo new listings since last check.")
 
@@ -551,70 +585,79 @@ def _build_search_config(
     dryer: bool | None = None,
     max_pages: int | None = None,
 ) -> SearchConfig:
-    """Create a SearchConfig for an ad-hoc MCP search.
+    """Build a SearchConfig from explicit filter arguments.
 
-    Only inherits structural settings (categories, location, order, max_pages)
-    from the base config.  Restrictive filters (rent, rooms, size, features)
-    are NOT inherited — the caller must pass them explicitly or they default
-    to no limit.
+    If no filter arguments are passed, returns the full base config (saved
+    search).  If ANY filter is passed, restrictive filters from the base
+    config are stripped — only structural settings (categories, location,
+    order, max_pages) carry over, plus whatever the caller explicitly set.
+
+    This is the same logic for both CLI and MCP.
     """
+    explicit: dict[str, Any] = {}
+    if cities is not None:
+        explicit["city_level_1"] = [c.lower() for c in cities]
+    if min_lat is not None:
+        if None in (min_lng, max_lat, max_lng):
+            raise ValueError("All four bbox params (min_lat, min_lng, max_lat, max_lng) must be provided together")
+        explicit["min_lat"] = min_lat
+        explicit["min_lng"] = min_lng
+        explicit["max_lat"] = max_lat
+        explicit["max_lng"] = max_lng
+    if rooms_min is not None:
+        explicit["rooms_min"] = rooms_min
+    if rooms_max is not None:
+        explicit["rooms_max"] = rooms_max
+    if max_rent is not None:
+        explicit["max_rent"] = max_rent
+    if min_size_m2 is not None:
+        explicit["min_size_m2"] = min_size_m2
+    if min_rental_period is not None:
+        explicit["min_rental_period"] = min_rental_period
+    if max_available_from is not None:
+        explicit["max_available_from"] = max_available_from
+    if pet_friendly is not None:
+        explicit["pet_friendly"] = pet_friendly
+    if balcony is not None:
+        explicit["balcony"] = balcony
+    if furnished is not None:
+        explicit["furnished"] = furnished
+    if parking is not None:
+        explicit["parking"] = parking
+    if elevator is not None:
+        explicit["elevator"] = elevator
+    if shareable is not None:
+        explicit["shareable"] = shareable
+    if student_only is not None:
+        explicit["student_only"] = student_only
+    if senior_friendly is not None:
+        explicit["senior_friendly"] = senior_friendly
+    if social_housing is not None:
+        explicit["social_housing"] = social_housing
+    if newbuild is not None:
+        explicit["newbuild"] = newbuild
+    if electric_charging_station is not None:
+        explicit["electric_charging_station"] = electric_charging_station
+    if dishwasher is not None:
+        explicit["dishwasher"] = dishwasher
+    if washing_machine is not None:
+        explicit["washing_machine"] = washing_machine
+    if dryer is not None:
+        explicit["dryer"] = dryer
+    if max_pages is not None:
+        explicit["max_pages"] = max_pages
+
+    if not explicit:
+        return base
+
     overrides: dict[str, Any] = {
         k: v for k, v in base.to_dict().items()
         if k not in _RESTRICTIVE_FILTERS
     }
+    overrides.update(explicit)
 
-    if cities is not None:
-        overrides["city_level_1"] = [c.lower() for c in cities]
-    if min_lat is not None:
-        if None in (min_lng, max_lat, max_lng):
-            raise ValueError("All four bbox params (min_lat, min_lng, max_lat, max_lng) must be provided together")
-        overrides["min_lat"] = min_lat
-        overrides["min_lng"] = min_lng
-        overrides["max_lat"] = max_lat
-        overrides["max_lng"] = max_lng
+    if "min_lat" in explicit:
         overrides["city_level_1"] = None
-    if rooms_min is not None:
-        overrides["rooms_min"] = rooms_min
-    if rooms_max is not None:
-        overrides["rooms_max"] = rooms_max
-    if max_rent is not None:
-        overrides["max_rent"] = max_rent
-    if min_size_m2 is not None:
-        overrides["min_size_m2"] = min_size_m2
-    if min_rental_period is not None:
-        overrides["min_rental_period"] = min_rental_period
-    if max_available_from is not None:
-        overrides["max_available_from"] = max_available_from
-    if pet_friendly is not None:
-        overrides["pet_friendly"] = pet_friendly
-    if balcony is not None:
-        overrides["balcony"] = balcony
-    if furnished is not None:
-        overrides["furnished"] = furnished
-    if parking is not None:
-        overrides["parking"] = parking
-    if elevator is not None:
-        overrides["elevator"] = elevator
-    if shareable is not None:
-        overrides["shareable"] = shareable
-    if student_only is not None:
-        overrides["student_only"] = student_only
-    if senior_friendly is not None:
-        overrides["senior_friendly"] = senior_friendly
-    if social_housing is not None:
-        overrides["social_housing"] = social_housing
-    if newbuild is not None:
-        overrides["newbuild"] = newbuild
-    if electric_charging_station is not None:
-        overrides["electric_charging_station"] = electric_charging_station
-    if dishwasher is not None:
-        overrides["dishwasher"] = dishwasher
-    if washing_machine is not None:
-        overrides["washing_machine"] = washing_machine
-    if dryer is not None:
-        overrides["dryer"] = dryer
-    if max_pages is not None:
-        overrides["max_pages"] = max_pages
 
     return SearchConfig.from_dict(overrides)
 
@@ -675,10 +718,10 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
         """Search boligportal.dk for rental listings matching the given filters.
 
         Returns all matching listings as a JSON array regardless of seen state.
-        Use this for broad searches or when you want the full result set.
 
-        Filters default to no limit — only the filters you pass are applied.
-        Location defaults to the server's config if not overridden.
+        If no filters are passed, uses the full saved search from the config.
+        If any filter is passed, starts from a clean slate — only structural
+        settings (location, categories) carry over.
 
         Args:
             cities: City names to search in (e.g. ["københavn", "frederiksberg"]).
@@ -761,7 +804,8 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
         Behaves like peek mode by default -- does not mark listings as seen
         unless mark_as_seen is True. Returns a JSON array.
 
-        Filters default to no limit — only the filters you pass are applied.
+        If no filters are passed, uses the full saved search from the config.
+        If any filter is passed, starts from a clean slate.
 
         Args:
             cities: City names to search in (e.g. ["københavn", "frederiksberg"]).
@@ -807,9 +851,10 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
             dryer=dryer, max_pages=max_pages,
         )
         listings = fetch_listings(search)
-        new = [l for l in listings if tracker.is_new(l.id)]
+        new = [l for l in listings if tracker.is_new(l.id, l.advertised_date)]
         if mark_as_seen and new:
-            tracker.mark_all_seen([l.id for l in new])
+            ad_dates = {l.id: l.advertised_date for l in new}
+            tracker.mark_all_seen([l.id for l in new], advertised_dates=ad_dates)
         return json.dumps([l.to_json_dict() for l in new], ensure_ascii=False)
 
     @mcp.tool()
@@ -901,55 +946,46 @@ Examples:
         init_config(args.config or DEFAULT_CONFIG_FILE)
         return
 
-    config = load_config(args.config)
+    base_config = load_config(args.config)
 
-    # Apply CLI overrides
-    if args.cities:
-        config.city_level_1 = [c.lower() for c in args.cities]
+    # Parse bbox into components
+    bbox_lat: float | None = None
+    bbox_lng: float | None = None
+    bbox_lat_max: float | None = None
+    bbox_lng_max: float | None = None
     if args.bbox:
         parts = [float(x.strip()) for x in args.bbox.split(",")]
         if len(parts) != 4:
             parser.error("--bbox requires exactly 4 values: min_lat,min_lng,max_lat,max_lng")
-        config.min_lat, config.min_lng, config.max_lat, config.max_lng = parts
-        config.city_level_1 = None
-    if args.rooms_min is not None:
-        config.rooms_min = args.rooms_min
-    if args.rooms_max is not None:
-        config.rooms_max = args.rooms_max
-    if args.max_rent is not None:
-        config.max_rent = args.max_rent
-    if args.min_size is not None:
-        config.min_size_m2 = args.min_size
-    if args.min_rental_period is not None:
-        config.min_rental_period = args.min_rental_period
-    if args.max_pages is not None:
-        config.max_pages = args.max_pages
-    if args.max_available_from is not None:
-        config.max_available_from = args.max_available_from
-    if args.pet_friendly:
-        config.pet_friendly = True
-    if args.balcony:
-        config.balcony = True
-    if args.furnished:
-        config.furnished = True
-    if args.shareable:
-        config.shareable = True
-    if args.student_only:
-        config.student_only = True
-    if args.senior_friendly:
-        config.senior_friendly = True
-    if args.social_housing:
-        config.social_housing = True
-    if args.newbuild:
-        config.newbuild = True
-    if args.ev_charging:
-        config.electric_charging_station = True
-    if args.dishwasher:
-        config.dishwasher = True
-    if args.washing_machine:
-        config.washing_machine = True
-    if args.dryer:
-        config.dryer = True
+        bbox_lat, bbox_lng, bbox_lat_max, bbox_lng_max = parts
+
+    config = _build_search_config(
+        base_config,
+        cities=args.cities,
+        min_lat=bbox_lat,
+        min_lng=bbox_lng,
+        max_lat=bbox_lat_max,
+        max_lng=bbox_lng_max,
+        rooms_min=args.rooms_min,
+        rooms_max=args.rooms_max,
+        max_rent=args.max_rent,
+        min_size_m2=args.min_size,
+        min_rental_period=args.min_rental_period,
+        max_available_from=args.max_available_from,
+        pet_friendly=True if args.pet_friendly else None,
+        balcony=True if args.balcony else None,
+        furnished=True if args.furnished else None,
+        shareable=True if args.shareable else None,
+        student_only=True if args.student_only else None,
+        senior_friendly=True if args.senior_friendly else None,
+        social_housing=True if args.social_housing else None,
+        newbuild=True if args.newbuild else None,
+        electric_charging_station=True if args.ev_charging else None,
+        dishwasher=True if args.dishwasher else None,
+        washing_machine=True if args.washing_machine else None,
+        dryer=True if args.dryer else None,
+        max_pages=args.max_pages,
+    )
 
     setup_logging(args.log_file, args.verbose)
 
