@@ -11,6 +11,7 @@
   "max_rent": 20000,
   "min_size_m2": 60,
   "min_rental_period": null,
+  "max_available_from": null,
   "pet_friendly": null,
   "balcony": null,
   "furnished": null,
@@ -19,6 +20,12 @@
   "shareable": null,
   "student_only": null,
   "senior_friendly": null,
+  "social_housing": null,
+  "newbuild": null,
+  "electric_charging_station": null,
+  "dishwasher": null,
+  "washing_machine": null,
+  "dryer": null,
   "order": "DEFAULT",
   "max_pages": 5
 }
