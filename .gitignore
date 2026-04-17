@@ -10,10 +10,5 @@ message.md
 contacted_listings/
 dry-run-screenshot.png
 
-# Local MCP client config (contains absolute paths)
-.mcp.json
-
 # OS / editor
 .DS_Store
-.claude/
-.playwright-mcp/
