@@ -22,6 +22,7 @@ import json
 import logging
 import random
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -36,6 +37,7 @@ DEFAULT_SEEN_FILE = Path(__file__).parent / ".boligwatch_seen.json"
 DEFAULT_CONFIG_FILE = Path(__file__).parent / "boligwatch_config.json"
 DEFAULT_LOG_FILE = Path(__file__).parent / "boligwatch.log"
 PAGE_SIZE = 18
+MAX_PAGES_CEILING = 50
 
 log = logging.getLogger("boligwatch")
 
@@ -75,6 +77,10 @@ class SearchConfig:
     dryer: bool | None = None
     order: str = "DEFAULT"
     max_pages: int = 5
+
+    def __post_init__(self) -> None:
+        if self.max_pages > MAX_PAGES_CEILING:
+            self.max_pages = MAX_PAGES_CEILING
 
     def to_api_body(self) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -141,6 +147,9 @@ class SearchConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SearchConfig:
         known_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        unknown = [k for k in data if k not in known_fields]
+        if unknown:
+            log.warning("Unknown config keys ignored: %s", ", ".join(unknown))
         filtered = {k: v for k, v in data.items() if k in known_fields}
         return cls(**filtered)
 
@@ -367,8 +376,16 @@ class SeenTracker:
                 self._seen = json.load(f)
 
     def _save(self) -> None:
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump(self._seen, f, indent=2, ensure_ascii=False)
+        fd, tmp = tempfile.mkstemp(
+            dir=self._path.parent, suffix=".tmp", prefix=".boligwatch_"
+        )
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(self._seen, f, indent=2, ensure_ascii=False)
+            Path(tmp).replace(self._path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def _get_ad_date(entry: Any) -> str | None:
@@ -376,14 +393,22 @@ class SeenTracker:
             return entry.get("advertised_date")
         return None
 
+    @staticmethod
+    def _parse_date(value: str) -> datetime:
+        return datetime.fromisoformat(value)
+
     def is_new(self, listing_id: int, advertised_date: str | None = None) -> bool:
         key = str(listing_id)
         if key not in self._seen:
             return True
         if advertised_date:
             stored_ad = self._get_ad_date(self._seen[key])
-            if stored_ad and advertised_date > stored_ad:
-                return True
+            if stored_ad:
+                try:
+                    if self._parse_date(advertised_date) > self._parse_date(stored_ad):
+                        return True
+                except (ValueError, TypeError):
+                    pass
         return False
 
     def mark_seen(self, listing_id: int, advertised_date: str | None = None) -> None:
@@ -930,6 +955,8 @@ Examples:
     parser.add_argument("--pet-friendly", action="store_true", default=None, help="only pet-friendly")
     parser.add_argument("--balcony", action="store_true", default=None, help="must have balcony/terrace")
     parser.add_argument("--furnished", action="store_true", default=None, help="must be furnished")
+    parser.add_argument("--parking", action="store_true", default=None, help="must have parking")
+    parser.add_argument("--elevator", action="store_true", default=None, help="must have elevator")
     parser.add_argument("--shareable", action="store_true", default=None, help="must be shareable (delevenlig)")
     parser.add_argument("--student-only", action="store_true", default=None, help="student-only listings")
     parser.add_argument("--senior-friendly", action="store_true", default=None, help="senior-friendly listings")
@@ -975,6 +1002,8 @@ Examples:
         pet_friendly=True if args.pet_friendly else None,
         balcony=True if args.balcony else None,
         furnished=True if args.furnished else None,
+        parking=True if args.parking else None,
+        elevator=True if args.elevator else None,
         shareable=True if args.shareable else None,
         student_only=True if args.student_only else None,
         senior_friendly=True if args.senior_friendly else None,

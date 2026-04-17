@@ -149,7 +149,7 @@ City names use lowercase Danish with original characters: `k\u00f8benhavn`, `fre
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--max-pages N` | int | `5` | Maximum pages to fetch (18 listings per page) |
+| `--max-pages N` | int | `5` | Maximum pages to fetch (18 listings per page, max 50) |
 
 ### CLI examples
 
@@ -196,7 +196,7 @@ python boligwatch.py --init-config --config my_search.json
 
 ### Config file format
 
-All fields are optional. Omit a field or set it to `null` for no limit.
+All fields are optional. Omit a field or set it to `null` for no limit. Unknown keys are logged as warnings to help catch typos.
 
 ```json
 {
@@ -329,7 +329,7 @@ Both `search_listings` and `get_new_listings` accept the same filter parameters:
 | `dishwasher` | `bool` | *no filter* | Has dishwasher |
 | `washing_machine` | `bool` | *no filter* | Has washing machine |
 | `dryer` | `bool` | *no filter* | Has dryer |
-| `max_pages` | `int` | `5` | Pages to fetch (18 per page) |
+| `max_pages` | `int` | `5` | Pages to fetch (18 per page, max 50) |
 
 `get_new_listings` also accepts:
 

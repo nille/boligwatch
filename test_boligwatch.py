@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 
 import pytest
 
-from boligwatch import SearchConfig, SeenTracker, _build_search_config, _RESTRICTIVE_FILTERS
+from boligwatch import SearchConfig, SeenTracker, _build_search_config, _RESTRICTIVE_FILTERS, MAX_PAGES_CEILING
 
 
 # -- Fixtures ----------------------------------------------------------------
@@ -290,3 +292,122 @@ class TestSeenTrackerRelisting:
         tracker.mark_seen(123, advertised_date="2026-04-15T10:00:00+00:00")
         tracker.reset()
         assert tracker.is_new(123) is True
+
+
+# -- Date comparison across timezone formats ---------------------------------
+
+class TestDateComparisonTimezones:
+
+    @pytest.fixture
+    def tracker(self, tmp_path: Path) -> SeenTracker:
+        return SeenTracker(tmp_path / "seen.json")
+
+    def test_z_suffix_vs_offset_equal(self, tracker: SeenTracker) -> None:
+        tracker.mark_seen(1, advertised_date="2026-04-17T09:00:00Z")
+        assert tracker.is_new(1, advertised_date="2026-04-17T09:00:00+00:00") is False
+
+    def test_offset_vs_z_suffix_equal(self, tracker: SeenTracker) -> None:
+        tracker.mark_seen(1, advertised_date="2026-04-17T09:00:00+00:00")
+        assert tracker.is_new(1, advertised_date="2026-04-17T09:00:00Z") is False
+
+    def test_z_suffix_newer_detected(self, tracker: SeenTracker) -> None:
+        tracker.mark_seen(1, advertised_date="2026-04-15T09:00:00+00:00")
+        assert tracker.is_new(1, advertised_date="2026-04-17T09:00:00Z") is True
+
+    def test_different_offsets_compared_correctly(self, tracker: SeenTracker) -> None:
+        tracker.mark_seen(1, advertised_date="2026-04-17T10:00:00+02:00")
+        assert tracker.is_new(1, advertised_date="2026-04-17T08:00:00+00:00") is False
+
+    def test_malformed_date_does_not_crash(self, tracker: SeenTracker) -> None:
+        tracker.mark_seen(1, advertised_date="not-a-date")
+        assert tracker.is_new(1, advertised_date="2026-04-17T09:00:00Z") is False
+
+
+# -- Atomic writes -----------------------------------------------------------
+
+class TestAtomicWrites:
+
+    def test_save_creates_file_atomically(self, tmp_path: Path) -> None:
+        path = tmp_path / "seen.json"
+        tracker = SeenTracker(path)
+        tracker.mark_seen(1)
+        assert path.exists()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert "1" in data
+
+    def test_no_temp_files_left_on_success(self, tmp_path: Path) -> None:
+        path = tmp_path / "seen.json"
+        tracker = SeenTracker(path)
+        tracker.mark_seen(1)
+        tmp_files = list(tmp_path.glob(".boligwatch_*.tmp"))
+        assert tmp_files == []
+
+    def test_file_survives_reload(self, tmp_path: Path) -> None:
+        path = tmp_path / "seen.json"
+        t1 = SeenTracker(path)
+        t1.mark_seen(42, advertised_date="2026-04-17T09:00:00+00:00")
+        t2 = SeenTracker(path)
+        assert t2.is_new(42) is False
+
+
+# -- Unknown config keys warning ---------------------------------------------
+
+class TestUnknownConfigKeys:
+
+    def test_unknown_key_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="boligwatch"):
+            SearchConfig.from_dict({"max_rnet": 15000, "rooms_min": 2})
+        assert "max_rnet" in caplog.text
+
+    def test_known_keys_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="boligwatch"):
+            SearchConfig.from_dict({"rooms_min": 2, "max_rent": 15000})
+        assert caplog.text == ""
+
+    def test_unknown_keys_still_ignored(self) -> None:
+        config = SearchConfig.from_dict({"max_rnet": 15000, "rooms_min": 2})
+        assert config.rooms_min == 2
+        assert not hasattr(config, "max_rnet")
+
+
+# -- max_pages ceiling -------------------------------------------------------
+
+class TestMaxPagesCeiling:
+
+    def test_excessive_max_pages_clamped(self) -> None:
+        config = SearchConfig.from_dict({"max_pages": 1000})
+        assert config.max_pages == MAX_PAGES_CEILING
+
+    def test_normal_max_pages_unchanged(self) -> None:
+        config = SearchConfig.from_dict({"max_pages": 10})
+        assert config.max_pages == 10
+
+    def test_ceiling_value_accepted(self) -> None:
+        config = SearchConfig.from_dict({"max_pages": MAX_PAGES_CEILING})
+        assert config.max_pages == MAX_PAGES_CEILING
+
+    def test_build_search_config_clamps_max_pages(self) -> None:
+        base = SearchConfig()
+        result = _build_search_config(base, max_pages=999)
+        assert result.max_pages == MAX_PAGES_CEILING
+
+
+# -- Missing CLI flags -------------------------------------------------------
+
+class TestParkingElevatorFlags:
+
+    def test_parking_in_api_body(self) -> None:
+        config = SearchConfig.from_dict({"parking": True})
+        body = config.to_api_body()
+        assert body["parking"] is True
+
+    def test_elevator_in_api_body(self) -> None:
+        config = SearchConfig.from_dict({"elevator": True})
+        body = config.to_api_body()
+        assert body["elevator"] is True
+
+    def test_parking_elevator_through_build(self) -> None:
+        base = SearchConfig()
+        result = _build_search_config(base, parking=True, elevator=True)
+        assert result.parking is True
+        assert result.elevator is True
