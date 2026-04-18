@@ -7,6 +7,27 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check boligwatch.py test_boligwatch.py
+      - run: ruff format --check boligwatch.py test_boligwatch.py
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install mypy
+      - run: mypy boligwatch.py
+
   test:
     runs-on: ubuntu-latest
     strategy:

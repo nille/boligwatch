@@ -1,40 +1,52 @@
-"""Tests for SearchConfig, _build_search_config, to_api_body, and SeenTracker."""
+"""Tests for SearchConfig, _build_search_config, to_api_body, SeenTracker, and API request."""
 
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boligwatch import SearchConfig, SeenTracker, _build_search_config, _RESTRICTIVE_FILTERS, MAX_PAGES_CEILING
-
+from boligwatch import (
+    _RESTRICTIVE_FILTERS,
+    MAX_PAGES_CEILING,
+    SearchConfig,
+    SeenTracker,
+    _api_request,
+    _api_request_urllib,
+    _backoff_delay,
+    _build_search_config,
+)
 
 # -- Fixtures ----------------------------------------------------------------
+
 
 @pytest.fixture
 def base_config() -> SearchConfig:
     """Simulates a typical config file with restrictive filters set."""
-    return SearchConfig.from_dict({
-        "categories": ["rental_apartment", "rental_house"],
-        "city_level_1": None,
-        "min_lat": 55.63,
-        "min_lng": 12.48,
-        "max_lat": 55.73,
-        "max_lng": 12.80,
-        "rooms_min": 3,
-        "max_rent": 17000,
-        "min_rental_period": 12,
-        "order": "DEFAULT",
-        "max_pages": 10,
-    })
+    return SearchConfig.from_dict(
+        {
+            "categories": ["rental_apartment", "rental_house"],
+            "city_level_1": None,
+            "min_lat": 55.63,
+            "min_lng": 12.48,
+            "max_lat": 55.73,
+            "max_lng": 12.80,
+            "rooms_min": 3,
+            "max_rent": 17000,
+            "min_rental_period": 12,
+            "order": "DEFAULT",
+            "max_pages": 10,
+        }
+    )
 
 
 # -- _build_search_config: no filters = saved search ------------------------
 
-class TestBuildSearchConfigSavedSearch:
 
+class TestBuildSearchConfigSavedSearch:
     def test_no_filters_returns_full_config(self, base_config: SearchConfig) -> None:
         result = _build_search_config(base_config)
         assert result.categories == ["rental_apartment", "rental_house"]
@@ -49,9 +61,13 @@ class TestBuildSearchConfigSavedSearch:
         assert result is base_config
 
     def test_no_filters_preserves_boolean_filters(self) -> None:
-        config = SearchConfig.from_dict({
-            "pet_friendly": True, "balcony": True, "max_rent": 15000,
-        })
+        config = SearchConfig.from_dict(
+            {
+                "pet_friendly": True,
+                "balcony": True,
+                "max_rent": 15000,
+            }
+        )
         result = _build_search_config(config)
         assert result.pet_friendly is True
         assert result.balcony is True
@@ -60,8 +76,8 @@ class TestBuildSearchConfigSavedSearch:
 
 # -- _build_search_config: any filter = clean slate --------------------------
 
-class TestBuildSearchConfigAdHoc:
 
+class TestBuildSearchConfigAdHoc:
     def test_any_filter_strips_restrictive(self, base_config: SearchConfig) -> None:
         result = _build_search_config(base_config, min_size_m2=200)
         assert result.min_size_m2 == 200
@@ -78,17 +94,30 @@ class TestBuildSearchConfigAdHoc:
         assert result.max_pages == 10
 
     def test_all_restrictive_filters_stripped(self) -> None:
-        rich_config = SearchConfig.from_dict({
-            "rooms_min": 2, "rooms_max": 5, "max_rent": 20000,
-            "min_size_m2": 60, "min_rental_period": 12,
-            "max_available_from": "2026-08-01",
-            "pet_friendly": True, "balcony": True, "furnished": True,
-            "parking": True, "elevator": True, "shareable": True,
-            "student_only": True, "senior_friendly": True,
-            "social_housing": True, "newbuild": True,
-            "electric_charging_station": True, "dishwasher": True,
-            "washing_machine": True, "dryer": True,
-        })
+        rich_config = SearchConfig.from_dict(
+            {
+                "rooms_min": 2,
+                "rooms_max": 5,
+                "max_rent": 20000,
+                "min_size_m2": 60,
+                "min_rental_period": 12,
+                "max_available_from": "2026-08-01",
+                "pet_friendly": True,
+                "balcony": True,
+                "furnished": True,
+                "parking": True,
+                "elevator": True,
+                "shareable": True,
+                "student_only": True,
+                "senior_friendly": True,
+                "social_housing": True,
+                "newbuild": True,
+                "electric_charging_station": True,
+                "dishwasher": True,
+                "washing_machine": True,
+                "dryer": True,
+            }
+        )
         result = _build_search_config(rich_config, rooms_min=4)
         for field_name in _RESTRICTIVE_FILTERS:
             if field_name == "rooms_min":
@@ -99,7 +128,9 @@ class TestBuildSearchConfigAdHoc:
     def test_explicit_filter_overrides_applied(self, base_config: SearchConfig) -> None:
         result = _build_search_config(
             base_config,
-            rooms_min=2, max_rent=15000, min_size_m2=80,
+            rooms_min=2,
+            max_rent=15000,
+            min_size_m2=80,
         )
         assert result.rooms_min == 2
         assert result.max_rent == 15000
@@ -117,7 +148,10 @@ class TestBuildSearchConfigAdHoc:
         city_config = SearchConfig.from_dict({"city_level_1": ["københavn"]})
         result = _build_search_config(
             city_config,
-            min_lat=55.6, min_lng=12.4, max_lat=55.7, max_lng=12.6,
+            min_lat=55.6,
+            min_lng=12.4,
+            max_lat=55.7,
+            max_lng=12.6,
         )
         assert result.min_lat == 55.6
         assert result.city_level_1 is None
@@ -133,7 +167,9 @@ class TestBuildSearchConfigAdHoc:
     def test_boolean_filters_pass_through(self, base_config: SearchConfig) -> None:
         result = _build_search_config(
             base_config,
-            pet_friendly=True, dishwasher=True, electric_charging_station=True,
+            pet_friendly=True,
+            dishwasher=True,
+            electric_charging_station=True,
         )
         assert result.pet_friendly is True
         assert result.dishwasher is True
@@ -152,8 +188,8 @@ class TestBuildSearchConfigAdHoc:
 
 # -- to_api_body mapping ----------------------------------------------------
 
-class TestToApiBody:
 
+class TestToApiBody:
     def test_minimal_config_has_categories_and_order(self) -> None:
         config = SearchConfig.from_dict({})
         body = config.to_api_body()
@@ -198,21 +234,34 @@ class TestToApiBody:
         assert body["max_available_from"] == "2026-08-01"
 
     def test_bbox_coordinates(self) -> None:
-        config = SearchConfig.from_dict({
-            "min_lat": 55.6, "min_lng": 12.4, "max_lat": 55.7, "max_lng": 12.6,
-        })
+        config = SearchConfig.from_dict(
+            {
+                "min_lat": 55.6,
+                "min_lng": 12.4,
+                "max_lat": 55.7,
+                "max_lng": 12.6,
+            }
+        )
         body = config.to_api_body()
         assert body["min_lat"] == 55.6
         assert body["max_lng"] == 12.6
 
     def test_boolean_filters_included_when_set(self) -> None:
         all_bools = {
-            "pet_friendly": True, "balcony": True, "furnished": True,
-            "parking": True, "elevator": True, "shareable": True,
-            "student_only": True, "senior_friendly": True,
-            "social_housing": True, "newbuild": True,
-            "electric_charging_station": True, "dishwasher": True,
-            "washing_machine": True, "dryer": True,
+            "pet_friendly": True,
+            "balcony": True,
+            "furnished": True,
+            "parking": True,
+            "elevator": True,
+            "shareable": True,
+            "student_only": True,
+            "senior_friendly": True,
+            "social_housing": True,
+            "newbuild": True,
+            "electric_charging_station": True,
+            "dishwasher": True,
+            "washing_machine": True,
+            "dryer": True,
         }
         config = SearchConfig.from_dict(all_bools)
         body = config.to_api_body()
@@ -222,8 +271,16 @@ class TestToApiBody:
     def test_boolean_filters_excluded_when_none(self) -> None:
         config = SearchConfig.from_dict({})
         body = config.to_api_body()
-        for key in ["pet_friendly", "balcony", "social_housing", "newbuild",
-                     "electric_charging_station", "dishwasher", "washing_machine", "dryer"]:
+        for key in [
+            "pet_friendly",
+            "balcony",
+            "social_housing",
+            "newbuild",
+            "electric_charging_station",
+            "dishwasher",
+            "washing_machine",
+            "dryer",
+        ]:
             assert key not in body, f"{key} should not be in API body when None"
 
     def test_none_filters_excluded_from_body(self) -> None:
@@ -238,8 +295,8 @@ class TestToApiBody:
 
 # -- SeenTracker: re-listing detection --------------------------------------
 
-class TestSeenTrackerRelisting:
 
+class TestSeenTrackerRelisting:
     @pytest.fixture
     def tracker(self, tmp_path: Path) -> SeenTracker:
         return SeenTracker(tmp_path / "seen.json")
@@ -296,8 +353,8 @@ class TestSeenTrackerRelisting:
 
 # -- Date comparison across timezone formats ---------------------------------
 
-class TestDateComparisonTimezones:
 
+class TestDateComparisonTimezones:
     @pytest.fixture
     def tracker(self, tmp_path: Path) -> SeenTracker:
         return SeenTracker(tmp_path / "seen.json")
@@ -325,8 +382,8 @@ class TestDateComparisonTimezones:
 
 # -- Atomic writes -----------------------------------------------------------
 
-class TestAtomicWrites:
 
+class TestAtomicWrites:
     def test_save_creates_file_atomically(self, tmp_path: Path) -> None:
         path = tmp_path / "seen.json"
         tracker = SeenTracker(path)
@@ -352,8 +409,8 @@ class TestAtomicWrites:
 
 # -- Unknown config keys warning ---------------------------------------------
 
-class TestUnknownConfigKeys:
 
+class TestUnknownConfigKeys:
     def test_unknown_key_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING, logger="boligwatch"):
             SearchConfig.from_dict({"max_rnet": 15000, "rooms_min": 2})
@@ -372,8 +429,8 @@ class TestUnknownConfigKeys:
 
 # -- max_pages ceiling -------------------------------------------------------
 
-class TestMaxPagesCeiling:
 
+class TestMaxPagesCeiling:
     def test_excessive_max_pages_clamped(self) -> None:
         config = SearchConfig.from_dict({"max_pages": 1000})
         assert config.max_pages == MAX_PAGES_CEILING
@@ -394,8 +451,8 @@ class TestMaxPagesCeiling:
 
 # -- Missing CLI flags -------------------------------------------------------
 
-class TestParkingElevatorFlags:
 
+class TestParkingElevatorFlags:
     def test_parking_in_api_body(self) -> None:
         config = SearchConfig.from_dict({"parking": True})
         body = config.to_api_body()
@@ -411,3 +468,62 @@ class TestParkingElevatorFlags:
         result = _build_search_config(base, parking=True, elevator=True)
         assert result.parking is True
         assert result.elevator is True
+
+
+# -- Backoff helper -----------------------------------------------------------
+
+
+class TestBackoffDelay:
+    def test_delay_increases_with_attempt(self) -> None:
+        d0 = _backoff_delay(0)
+        d2 = _backoff_delay(2)
+        assert d2 > d0
+
+    def test_delay_has_jitter(self) -> None:
+        delays = {_backoff_delay(1) for _ in range(20)}
+        assert len(delays) > 1
+
+
+# -- API request dispatch ------------------------------------------------------
+
+
+class TestApiRequestDispatch:
+    def test_delegates_to_cffi_when_available(self) -> None:
+        with (
+            patch("boligwatch._HAS_CURL_CFFI", True),
+            patch("boligwatch._api_request_cffi", return_value={"results": []}) as mock,
+        ):
+            result = _api_request("https://example.com", b"{}")
+            mock.assert_called_once_with("https://example.com", b"{}")
+            assert result == {"results": []}
+
+    def test_delegates_to_urllib_when_cffi_unavailable(self) -> None:
+        with (
+            patch("boligwatch._HAS_CURL_CFFI", False),
+            patch("boligwatch._api_request_urllib", return_value={"results": []}) as mock,
+        ):
+            result = _api_request("https://example.com", b"{}")
+            mock.assert_called_once_with("https://example.com", b"{}")
+            assert result == {"results": []}
+
+
+# -- urllib backend retries 403 ------------------------------------------------
+
+
+class TestUrllibRetries403:
+    def test_403_is_retried(self) -> None:
+        import urllib.error
+
+        effects = [
+            urllib.error.HTTPError("url", 403, "Forbidden", {}, None),
+            urllib.error.HTTPError("url", 403, "Forbidden", {}, None),
+            MagicMock(
+                read=MagicMock(return_value=b'{"results": []}'),
+                __enter__=MagicMock(),
+                __exit__=MagicMock(return_value=False),
+            ),
+        ]
+        effects[2].__enter__.return_value = effects[2]
+        with patch("urllib.request.urlopen", side_effect=effects), patch("time.sleep"):
+            result = _api_request_urllib("https://example.com", b"{}")
+            assert result == {"results": []}
