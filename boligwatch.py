@@ -33,6 +33,13 @@ from typing import Any
 
 API_URL = "https://www.boligportal.dk/api/search/list"
 LISTING_BASE = "https://www.boligportal.dk"
+
+try:
+    from curl_cffi import requests as _cffi_requests
+
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _HAS_CURL_CFFI = False
 DEFAULT_SEEN_FILE = Path(__file__).parent / ".boligwatch_seen.json"
 DEFAULT_CONFIG_FILE = Path(__file__).parent / "boligwatch_config.json"
 DEFAULT_LOG_FILE = Path(__file__).parent / "boligwatch.log"
@@ -44,11 +51,10 @@ log = logging.getLogger("boligwatch")
 
 # -- Config ----------------------------------------------------------------
 
+
 @dataclass
 class SearchConfig:
-    categories: list[str] = field(
-        default_factory=lambda: ["rental_apartment", "rental_house", "rental_townhouse"]
-    )
+    categories: list[str] = field(default_factory=lambda: ["rental_apartment", "rental_house", "rental_townhouse"])
     city_level_1: list[str] | None = field(default_factory=lambda: ["københavn"])
     city_level_2: list[str] | None = None
     min_lat: float | None = None
@@ -189,6 +195,7 @@ DEFAULT_CONFIG_TEMPLATE = {
 
 # -- API Client ------------------------------------------------------------
 
+
 @dataclass
 class Listing:
     id: int
@@ -276,7 +283,10 @@ class Listing:
         date_str = ""
         if self.advertised_date:
             try:
-                dt = datetime.fromisoformat(self.advertised_date)
+                ad = self.advertised_date
+                if ad.endswith("Z"):
+                    ad = ad[:-1] + "+00:00"
+                dt = datetime.fromisoformat(ad)
                 date_str = dt.strftime(" [%Y-%m-%d %H:%M]")
             except (ValueError, TypeError):
                 pass
@@ -293,8 +303,57 @@ BACKOFF_BASE = 2.0
 BACKOFF_MAX = 300.0
 
 
-def _api_request(url: str, body_bytes: bytes) -> dict[str, Any]:
-    """POST to the boligportal API with exponential backoff + jitter."""
+def _backoff_delay(attempt: int) -> float:
+    delay = min(BACKOFF_BASE ** (attempt + 1), BACKOFF_MAX)
+    return delay + random.uniform(0, delay * 0.5)
+
+
+def _api_request_cffi(url: str, body_bytes: bytes) -> dict[str, Any]:
+    """POST using curl_cffi with Chrome TLS fingerprint (bypasses Cloudflare)."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = _cffi_requests.post(
+                url,
+                headers={
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Origin": "https://www.boligportal.dk",
+                    "Referer": "https://www.boligportal.dk/",
+                },
+                data=body_bytes,
+                impersonate="chrome",
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return dict(resp.json())
+            if resp.status_code in (403, 429) or resp.status_code >= 500:
+                wait = _backoff_delay(attempt)
+                print(
+                    f"  HTTP {resp.status_code} -- backing off {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise urllib.error.HTTPError(
+                url,
+                resp.status_code,
+                resp.reason or "Error",
+                {},  # type: ignore[arg-type]
+                None,
+            )
+        except (OSError, TimeoutError):
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait = _backoff_delay(attempt)
+            print(
+                f"  Network error -- retrying in {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"Failed after {MAX_RETRIES} retries")
+
+
+def _api_request_urllib(url: str, body_bytes: bytes) -> dict[str, Any]:
+    """POST using stdlib urllib (no external dependencies)."""
     for attempt in range(MAX_RETRIES):
         req = urllib.request.Request(
             url,
@@ -307,12 +366,10 @@ def _api_request(url: str, body_bytes: bytes) -> dict[str, Any]:
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                return dict(json.loads(resp.read().decode("utf-8")))
         except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
-                delay = min(BACKOFF_BASE ** (attempt + 1), BACKOFF_MAX)
-                jitter = random.uniform(0, delay * 0.5)
-                wait = delay + jitter
+            if e.code in (403, 429) or e.code >= 500:
+                wait = _backoff_delay(attempt)
                 print(
                     f"  HTTP {e.code} -- backing off {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
                     file=sys.stderr,
@@ -323,15 +380,24 @@ def _api_request(url: str, body_bytes: bytes) -> dict[str, Any]:
         except (urllib.error.URLError, TimeoutError):
             if attempt == MAX_RETRIES - 1:
                 raise
-            delay = min(BACKOFF_BASE ** (attempt + 1), BACKOFF_MAX)
-            jitter = random.uniform(0, delay * 0.5)
-            wait = delay + jitter
+            wait = _backoff_delay(attempt)
             print(
                 f"  Network error -- retrying in {wait:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})",
                 file=sys.stderr,
             )
             time.sleep(wait)
     raise RuntimeError(f"Failed after {MAX_RETRIES} retries")
+
+
+def _api_request(url: str, body_bytes: bytes) -> dict[str, Any]:
+    """POST to the boligportal API with exponential backoff + jitter.
+
+    Uses curl_cffi when installed (bypasses Cloudflare bot challenges via
+    Chrome TLS fingerprint impersonation). Falls back to stdlib urllib.
+    """
+    if _HAS_CURL_CFFI:
+        return _api_request_cffi(url, body_bytes)
+    return _api_request_urllib(url, body_bytes)
 
 
 def fetch_listings(config: SearchConfig) -> list[Listing]:
@@ -356,6 +422,7 @@ def fetch_listings(config: SearchConfig) -> list[Listing]:
 
 # -- Seen-Listings Tracker -------------------------------------------------
 
+
 class SeenTracker:
     """Track which listings have been seen, detecting re-listings.
 
@@ -376,9 +443,7 @@ class SeenTracker:
                 self._seen = json.load(f)
 
     def _save(self) -> None:
-        fd, tmp = tempfile.mkstemp(
-            dir=self._path.parent, suffix=".tmp", prefix=".boligwatch_"
-        )
+        fd, tmp = tempfile.mkstemp(dir=self._path.parent, suffix=".tmp", prefix=".boligwatch_")
         try:
             with open(fd, "w", encoding="utf-8") as f:
                 json.dump(self._seen, f, indent=2, ensure_ascii=False)
@@ -395,6 +460,8 @@ class SeenTracker:
 
     @staticmethod
     def _parse_date(value: str) -> datetime:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
         return datetime.fromisoformat(value)
 
     def is_new(self, listing_id: int, advertised_date: str | None = None) -> bool:
@@ -449,6 +516,7 @@ class SeenTracker:
 
 # -- Logging ---------------------------------------------------------------
 
+
 def setup_logging(log_file: Path | None, verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     fmt = "%(asctime)s %(levelname)s %(message)s"
@@ -460,6 +528,7 @@ def setup_logging(log_file: Path | None, verbose: bool) -> None:
 
 # -- CLI -------------------------------------------------------------------
 
+
 def print_header(config: SearchConfig, total: int, new_count: int) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if config.min_lat is not None:
@@ -470,7 +539,9 @@ def print_header(config: SearchConfig, total: int, new_count: int) -> None:
         location = "all"
     rooms = ""
     if config.rooms_min is not None and config.rooms_max is not None:
-        rooms = f"{config.rooms_min}-{config.rooms_max}" if config.rooms_min != config.rooms_max else str(config.rooms_min)
+        rooms = (
+            f"{config.rooms_min}-{config.rooms_max}" if config.rooms_min != config.rooms_max else str(config.rooms_min)
+        )
     elif config.rooms_min is not None:
         rooms = f"{config.rooms_min}+"
     elif config.rooms_max is not None:
@@ -479,12 +550,12 @@ def print_header(config: SearchConfig, total: int, new_count: int) -> None:
     size = f", min {config.min_size_m2}m\u00b2" if config.min_size_m2 else ""
     period = f", min {config.min_rental_period}mo" if config.min_rental_period else ""
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"BoligWatch  {now}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Search: {location} | {rooms} rooms{rent}{size}{period}")
     print(f"Found: {total} total, {new_count} new")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 def run_once(
@@ -495,15 +566,15 @@ def run_once(
     peek: bool = False,
 ) -> list[Listing]:
     listings = fetch_listings(config)
-    new_listings = [l for l in listings if tracker.is_new(l.id, l.advertised_date)]
+    new_listings = [it for it in listings if tracker.is_new(it.id, it.advertised_date)]
 
     if json_output:
         if new_listings:
-            output = [l.to_json_dict() for l in new_listings]
+            output = [it.to_json_dict() for it in new_listings]
             print(json.dumps(output, ensure_ascii=False))
             if not peek:
-                ad_dates = {l.id: l.advertised_date for l in new_listings}
-                tracker.mark_all_seen([l.id for l in new_listings], advertised_dates=ad_dates)
+                ad_dates = {it.id: it.advertised_date for it in new_listings}
+                tracker.mark_all_seen([it.id for it in new_listings], advertised_dates=ad_dates)
         else:
             print("[]")
         return new_listings
@@ -516,8 +587,8 @@ def run_once(
             print()
         for listing in new_listings:
             print(f"\n{listing.format_short()}")
-        ad_dates = {l.id: l.advertised_date for l in new_listings}
-        tracker.mark_all_seen([l.id for l in new_listings], advertised_dates=ad_dates)
+        ad_dates = {it.id: it.advertised_date for it in new_listings}
+        tracker.mark_all_seen([it.id for it in new_listings], advertised_dates=ad_dates)
     elif not quiet:
         print("\nNo new listings since last check.")
 
@@ -572,11 +643,26 @@ def load_config(path: Path | None) -> SearchConfig:
 # -- MCP Server ------------------------------------------------------------
 
 _RESTRICTIVE_FILTERS = {
-    "rooms_min", "rooms_max", "max_rent", "min_size_m2", "min_rental_period",
-    "max_available_from", "pet_friendly", "balcony", "furnished", "parking",
-    "elevator", "shareable", "student_only", "senior_friendly",
-    "social_housing", "newbuild", "electric_charging_station",
-    "dishwasher", "washing_machine", "dryer",
+    "rooms_min",
+    "rooms_max",
+    "max_rent",
+    "min_size_m2",
+    "min_rental_period",
+    "max_available_from",
+    "pet_friendly",
+    "balcony",
+    "furnished",
+    "parking",
+    "elevator",
+    "shareable",
+    "student_only",
+    "senior_friendly",
+    "social_housing",
+    "newbuild",
+    "electric_charging_station",
+    "dishwasher",
+    "washing_machine",
+    "dryer",
 }
 
 
@@ -675,10 +761,7 @@ def _build_search_config(
     if not explicit:
         return base
 
-    overrides: dict[str, Any] = {
-        k: v for k, v in base.to_dict().items()
-        if k not in _RESTRICTIVE_FILTERS
-    }
+    overrides: dict[str, Any] = {k: v for k, v in base.to_dict().items() if k not in _RESTRICTIVE_FILTERS}
     overrides.update(explicit)
 
     if "min_lat" in explicit:
@@ -693,10 +776,7 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
         from mcp.server.fastmcp import FastMCP
     except ImportError:
         print(
-            "MCP mode requires the 'mcp' package. Install it with:\n"
-            "  pip install mcp\n"
-            "or:\n"
-            "  uv pip install mcp",
+            "MCP mode requires the 'mcp' package. Install it with:\n  pip install mcp\nor:\n  uv pip install mcp",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -778,21 +858,36 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
             max_pages: Maximum pages to fetch (18 listings per page, default 5).
         """
         search = _build_search_config(
-            config, cities=cities, min_lat=min_lat, min_lng=min_lng,
-            max_lat=max_lat, max_lng=max_lng, rooms_min=rooms_min,
-            rooms_max=rooms_max, max_rent=max_rent, min_size_m2=min_size_m2,
+            config,
+            cities=cities,
+            min_lat=min_lat,
+            min_lng=min_lng,
+            max_lat=max_lat,
+            max_lng=max_lng,
+            rooms_min=rooms_min,
+            rooms_max=rooms_max,
+            max_rent=max_rent,
+            min_size_m2=min_size_m2,
             min_rental_period=min_rental_period,
             max_available_from=max_available_from,
-            pet_friendly=pet_friendly, balcony=balcony, furnished=furnished,
-            parking=parking, elevator=elevator, shareable=shareable,
-            student_only=student_only, senior_friendly=senior_friendly,
-            social_housing=social_housing, newbuild=newbuild,
+            pet_friendly=pet_friendly,
+            balcony=balcony,
+            furnished=furnished,
+            parking=parking,
+            elevator=elevator,
+            shareable=shareable,
+            student_only=student_only,
+            senior_friendly=senior_friendly,
+            social_housing=social_housing,
+            newbuild=newbuild,
             electric_charging_station=electric_charging_station,
-            dishwasher=dishwasher, washing_machine=washing_machine,
-            dryer=dryer, max_pages=max_pages,
+            dishwasher=dishwasher,
+            washing_machine=washing_machine,
+            dryer=dryer,
+            max_pages=max_pages,
         )
         listings = fetch_listings(search)
-        return json.dumps([l.to_json_dict() for l in listings], ensure_ascii=False)
+        return json.dumps([it.to_json_dict() for it in listings], ensure_ascii=False)
 
     @mcp.tool()
     def get_new_listings(
@@ -862,25 +957,40 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
             mark_as_seen: If True, mark returned listings as seen (default False).
         """
         search = _build_search_config(
-            config, cities=cities, min_lat=min_lat, min_lng=min_lng,
-            max_lat=max_lat, max_lng=max_lng, rooms_min=rooms_min,
-            rooms_max=rooms_max, max_rent=max_rent, min_size_m2=min_size_m2,
+            config,
+            cities=cities,
+            min_lat=min_lat,
+            min_lng=min_lng,
+            max_lat=max_lat,
+            max_lng=max_lng,
+            rooms_min=rooms_min,
+            rooms_max=rooms_max,
+            max_rent=max_rent,
+            min_size_m2=min_size_m2,
             min_rental_period=min_rental_period,
             max_available_from=max_available_from,
-            pet_friendly=pet_friendly, balcony=balcony, furnished=furnished,
-            parking=parking, elevator=elevator, shareable=shareable,
-            student_only=student_only, senior_friendly=senior_friendly,
-            social_housing=social_housing, newbuild=newbuild,
+            pet_friendly=pet_friendly,
+            balcony=balcony,
+            furnished=furnished,
+            parking=parking,
+            elevator=elevator,
+            shareable=shareable,
+            student_only=student_only,
+            senior_friendly=senior_friendly,
+            social_housing=social_housing,
+            newbuild=newbuild,
             electric_charging_station=electric_charging_station,
-            dishwasher=dishwasher, washing_machine=washing_machine,
-            dryer=dryer, max_pages=max_pages,
+            dishwasher=dishwasher,
+            washing_machine=washing_machine,
+            dryer=dryer,
+            max_pages=max_pages,
         )
         listings = fetch_listings(search)
-        new = [l for l in listings if tracker.is_new(l.id, l.advertised_date)]
+        new = [it for it in listings if tracker.is_new(it.id, it.advertised_date)]
         if mark_as_seen and new:
-            ad_dates = {l.id: l.advertised_date for l in new}
-            tracker.mark_all_seen([l.id for l in new], advertised_dates=ad_dates)
-        return json.dumps([l.to_json_dict() for l in new], ensure_ascii=False)
+            ad_dates = {it.id: it.advertised_date for it in new}
+            tracker.mark_all_seen([it.id for it in new], advertised_dates=ad_dates)
+        return json.dumps([it.to_json_dict() for it in new], ensure_ascii=False)
 
     @mcp.tool()
     def mark_seen(ids: list[int]) -> dict[str, Any]:
@@ -911,6 +1021,7 @@ def run_mcp_server(config: SearchConfig, tracker: SeenTracker) -> None:
 
 # -- Entry point -----------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Monitor boligportal.dk for new rental listings.",
@@ -929,42 +1040,116 @@ Examples:
         """,
     )
     parser.add_argument("--watch", "-w", action="store_true", help="continuously poll for new listings")
-    parser.add_argument("--interval", "-i", type=int, default=300, help="poll interval in seconds (default: 300)")
-    parser.add_argument("--json", action="store_true", dest="json_output", help="output new listings as JSON (for piping to agents)")
-    parser.add_argument("--peek", action="store_true", help="like --json but do NOT mark listings as seen (for retry-safe workflows)")
-    parser.add_argument("--mark-seen", nargs="+", type=int, metavar="ID", help="mark specific listing IDs as seen")
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=300,
+        help="poll interval in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="output new listings as JSON (for piping to agents)",
+    )
+    parser.add_argument(
+        "--peek",
+        action="store_true",
+        help="like --json but do NOT mark listings as seen (for retry-safe workflows)",
+    )
+    parser.add_argument(
+        "--mark-seen",
+        nargs="+",
+        type=int,
+        metavar="ID",
+        help="mark specific listing IDs as seen",
+    )
     parser.add_argument("--config", "-c", type=Path, help="path to config JSON file")
     parser.add_argument("--init-config", action="store_true", help="generate a config template file")
-    parser.add_argument("--seen-file", type=Path, default=DEFAULT_SEEN_FILE, help="path to seen-listings tracker")
+    parser.add_argument(
+        "--seen-file",
+        type=Path,
+        default=DEFAULT_SEEN_FILE,
+        help="path to seen-listings tracker",
+    )
     parser.add_argument("--log-file", type=Path, default=None, help="write log to file (default: none)")
     parser.add_argument("--verbose", "-v", action="store_true", help="verbose logging")
-    parser.add_argument("--reset", action="store_true", help="clear seen-listings history before running")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="clear seen-listings history before running",
+    )
     parser.add_argument("--mcp", action="store_true", help="start as MCP server (stdio transport)")
 
     # Inline filter overrides (take precedence over config file)
     parser.add_argument("--city", action="append", dest="cities", help="city to search (can repeat)")
-    parser.add_argument("--bbox", type=str, metavar="S,W,N,E",
-                        help="bounding box as min_lat,min_lng,max_lat,max_lng (replaces --city)")
+    parser.add_argument(
+        "--bbox",
+        type=str,
+        metavar="S,W,N,E",
+        help="bounding box as min_lat,min_lng,max_lat,max_lng (replaces --city)",
+    )
     parser.add_argument("--rooms-min", type=int, help="minimum rooms")
     parser.add_argument("--rooms-max", type=int, help="maximum rooms")
     parser.add_argument("--max-rent", type=int, help="maximum monthly rent in DKK")
     parser.add_argument("--min-size", type=int, help="minimum size in m2")
     parser.add_argument("--min-rental-period", type=int, help="minimum lease in months (12 = 1 year)")
     parser.add_argument("--max-pages", type=int, help="max pages to fetch (18 results each)")
-    parser.add_argument("--max-available-from", type=str, metavar="YYYY-MM-DD", help="latest move-in date")
+    parser.add_argument(
+        "--max-available-from",
+        type=str,
+        metavar="YYYY-MM-DD",
+        help="latest move-in date",
+    )
     parser.add_argument("--pet-friendly", action="store_true", default=None, help="only pet-friendly")
     parser.add_argument("--balcony", action="store_true", default=None, help="must have balcony/terrace")
     parser.add_argument("--furnished", action="store_true", default=None, help="must be furnished")
     parser.add_argument("--parking", action="store_true", default=None, help="must have parking")
     parser.add_argument("--elevator", action="store_true", default=None, help="must have elevator")
-    parser.add_argument("--shareable", action="store_true", default=None, help="must be shareable (delevenlig)")
-    parser.add_argument("--student-only", action="store_true", default=None, help="student-only listings")
-    parser.add_argument("--senior-friendly", action="store_true", default=None, help="senior-friendly listings")
-    parser.add_argument("--social-housing", action="store_true", default=None, help="social housing only (almen bolig)")
-    parser.add_argument("--newbuild", action="store_true", default=None, help="new-build/project rentals only (projektudlejning)")
-    parser.add_argument("--ev-charging", action="store_true", default=None, help="must have EV charging station (ladestander)")
+    parser.add_argument(
+        "--shareable",
+        action="store_true",
+        default=None,
+        help="must be shareable (delevenlig)",
+    )
+    parser.add_argument(
+        "--student-only",
+        action="store_true",
+        default=None,
+        help="student-only listings",
+    )
+    parser.add_argument(
+        "--senior-friendly",
+        action="store_true",
+        default=None,
+        help="senior-friendly listings",
+    )
+    parser.add_argument(
+        "--social-housing",
+        action="store_true",
+        default=None,
+        help="social housing only (almen bolig)",
+    )
+    parser.add_argument(
+        "--newbuild",
+        action="store_true",
+        default=None,
+        help="new-build/project rentals only (projektudlejning)",
+    )
+    parser.add_argument(
+        "--ev-charging",
+        action="store_true",
+        default=None,
+        help="must have EV charging station (ladestander)",
+    )
     parser.add_argument("--dishwasher", action="store_true", default=None, help="must have dishwasher")
-    parser.add_argument("--washing-machine", action="store_true", default=None, help="must have washing machine")
+    parser.add_argument(
+        "--washing-machine",
+        action="store_true",
+        default=None,
+        help="must have washing machine",
+    )
     parser.add_argument("--dryer", action="store_true", default=None, help="must have dryer")
 
     args = parser.parse_args()

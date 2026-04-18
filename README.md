@@ -1,11 +1,17 @@
 # BoligWatch
 
+[![CI](https://github.com/nille/boligwatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nille/boligwatch/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 CLI tool and MCP server that monitors [boligportal.dk](https://www.boligportal.dk) for new rental listings in Denmark. Polls the same public search API the website uses — no account or API key required.
 
 ## Requirements
 
 - Python 3.10+
-- No external dependencies for CLI mode (stdlib only)
+- CLI mode works with stdlib only (zero required dependencies)
+- `pip install curl_cffi` — recommended, bypasses Cloudflare bot protection (see [Cloudflare bypass](#cloudflare-bypass))
 - `pip install mcp` for MCP server mode
 
 ## Installation
@@ -19,8 +25,11 @@ cd boligwatch
 python3 -m venv .venv
 source .venv/bin/activate
 
-# CLI mode works out of the box — no dependencies needed
+# CLI mode works out of the box with stdlib only
 python boligwatch.py --help
+
+# Recommended: install curl_cffi to bypass Cloudflare bot protection
+pip install curl_cffi
 
 # For MCP server mode, install the MCP SDK
 pip install mcp
@@ -513,6 +522,20 @@ contact the landlord with a message in Danish, and notify me on Slack.
 ```
 
 Because the extension bridges into your existing browser session, Claude authenticates as you — no separate login flow, no stored credentials.
+
+## Cloudflare bypass
+
+Boligportal.dk uses Cloudflare bot protection, which can block requests from standard HTTP clients like Python's `urllib` with an HTTP 403 and a JavaScript challenge. When this happens, the API becomes unreachable.
+
+Installing `curl_cffi` enables Chrome TLS fingerprint impersonation, which bypasses the challenge transparently:
+
+```bash
+pip install curl_cffi
+```
+
+When `curl_cffi` is installed, BoligWatch automatically uses it for all API requests. When it's not installed, BoligWatch falls back to stdlib `urllib` — which works fine when Cloudflare isn't actively challenging requests.
+
+Both backends retry on HTTP 403, 429, and 5xx errors with exponential backoff.
 
 ## Listing output format
 
